@@ -58,38 +58,54 @@ public:
 
     SOCKET fd() const { return socket_; }
 
-    // try to connect or throw on failure
-    void connect(const std::string &host, int port) {
+    // try to connect to syslog server
+    // throw connection timed out error if unable to connect within specified time
+    void connect(const std::string &host, int port, int timeout_secs) {
+        // if socket is already connected, close pre-existing connection to start new connection
         if (is_connected()) {
             close();
         }
+
+        // establish criteria of network connection
         struct addrinfo hints {};
         ZeroMemory(&hints, sizeof(hints));
-
-        hints.ai_family = AF_UNSPEC;      // To work with IPv4, IPv6, and so on
-        hints.ai_socktype = SOCK_STREAM;  // TCP
-        hints.ai_flags = AI_NUMERICSERV;  // port passed as as numeric value
+        hints.ai_family = AF_UNSPEC;      // To work with address families IPv4, IPv6, and so on
+        hints.ai_socktype = SOCK_STREAM;  // TCP will be used to establish a reliable connection
         hints.ai_protocol = 0;
 
+        // get address info of attempted connection, return 0 if successful
         auto port_str = std::to_string(port);
         struct addrinfo *addrinfo_result;
         auto rv = ::getaddrinfo(host.c_str(), port_str.c_str(), &hints, &addrinfo_result);
         int last_error = 0;
+
+        // if there was an error getting address info
         if (rv != 0) {
             last_error = ::WSAGetLastError();
             WSACleanup();
             throw_winsock_error_("getaddrinfo failed", last_error);
         }
 
-        // Try each address until we successfully connect(2).
-
+        // try each address until we successfully connect
         for (auto *rp = addrinfo_result; rp != nullptr; rp = rp->ai_next) {
+            // attempt to connect to current address, if unsuccessful move onto the next
             socket_ = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
             if (socket_ == INVALID_SOCKET) {
                 last_error = ::WSAGetLastError();
                 WSACleanup();
                 continue;
             }
+
+            // set timeout for connection to user address, if no connection occurs within time limit move onto next address
+            struct timeval timeout_obj; // timeout_obj that will hold the timeout length
+            timeout_obj.tv_sec = timeout_secs; // set length of timeout in seconds based on passed-in parameter
+            timeout_obj.tv_usec = 0; // we are not using microseconds in this case
+            // server receive timeout (from user trying to connect)
+            setsockopt(socket_, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout_obj, sizeof(timeout_obj));
+            // server send timeout (to user trying to connect)
+            setsockopt(socket_, SOL_SOCKET, SO_SNDTIMEO, (const char*)&timeout_obj, sizeof(timeout_obj));
+
+            // try to connect to syslog server using current address, if successful break out of loop
             if (::connect(socket_, rp->ai_addr, (int)rp->ai_addrlen) == 0) {
                 break;
             } else {
@@ -97,13 +113,15 @@ public:
                 close();
             }
         }
+
+        // free address info and throw connection failed error if no connection was made
         ::freeaddrinfo(addrinfo_result);
         if (socket_ == INVALID_SOCKET) {
             WSACleanup();
             throw_winsock_error_("connect failed", last_error);
         }
 
-        // set TCP_NODELAY
+        // disable Nagle's algorithm to allow data packets to be sent immediately 
         int enable_flag = 1;
         ::setsockopt(socket_, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<char *>(&enable_flag),
                      sizeof(enable_flag));
